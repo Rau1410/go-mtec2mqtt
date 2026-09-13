@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/SukramJ/go-hamqtt/discovery"
 	"github.com/SukramJ/go-hamqtt/publisher"
 	hagomqtt "github.com/SukramJ/go-hamqtt/publisher/gomqtt"
 	"github.com/SukramJ/go-mqtt"
@@ -35,6 +36,7 @@ import (
 	"github.com/SukramJ/go-mtec2mqtt/internal/modbus"
 	"github.com/SukramJ/go-mtec2mqtt/internal/registers"
 	"github.com/SukramJ/go-mtec2mqtt/internal/state"
+	"github.com/SukramJ/go-mtec2mqtt/internal/version"
 )
 
 // Errors surfaced to synchronous (web UI) writers whose command never
@@ -160,6 +162,64 @@ const StateQoS = publisher.QoSAtMostOnce
 // library reads an omitted field as neither.
 const CommandQoS = publisher.QoSAtLeastOnce
 
+// HARuntimeConfig is the publisher.Config this daemon's Home Assistant
+// plane runs on, in ONE place.
+//
+// It exists because the composition root and the test fixtures each used
+// to spell it out, and a mutation pass found the consequence: dropping
+// [publisher.Config.LegacyEntityTopics] from the composition root was
+// caught by nothing at all, while every test went on exercising a runtime
+// that still had it. That field is not a detail — omitting it makes the
+// library retract the five-segment form this fleet is not on, which
+// retracts nothing, publishes the device document into a tree still
+// holding all 100 per-entity configs, and produces the silent refusal this
+// whole release exists to avoid. Now there is one spelling and the tests
+// run on it.
+//
+// The logger is a parameter because the daemon and the fixtures want
+// different ones; everything else is derived.
+func HARuntimeConfig(cfg *config.Config, logger *slog.Logger) publisher.Config {
+	return publisher.Config{
+		Prefix: cfg.HASSBaseTopic,
+		Layout: hass.Layout{Root: cfg.MQTTTopic},
+		QoS:    DiscoveryQoS,
+		// The per-entity topic form this fleet's installed base is on,
+		// stated rather than defaulted. publisher.Runtime.PublishBundle
+		// reads it to decide which retained configs the device document
+		// supersedes; naming a form REPLACES the library's five-segment
+		// default rather than adding to it, which is the intent — 100 of
+		// 100 of this fleet's retained configs are on the four-segment
+		// form and the default matches 0.
+		LegacyEntityTopics: hass.LegacyConfigTopicForms(),
+		Logger:             logger,
+	}
+}
+
+// wantLegacyForms is what [publisher.Runtime.LegacyForms] must report for
+// a runtime this package will drive. The library exports that accessor
+// "for a consumer's own assertion"; this is the consumer making it.
+//
+// Derived from [HARuntimeConfig] rather than written out as a literal, so
+// the guard and the thing it guards cannot drift apart. That the form it
+// resolves to is the one this fleet's 100 retained configs are actually on
+// is asserted in internal/hass, against the pins.
+func wantLegacyForms() []string {
+	cfg := HARuntimeConfig(&config.Config{}, slog.New(slog.DiscardHandler))
+	probe := publisher.New(nopTransport{}, cfg)
+	defer probe.Close()
+	return probe.LegacyForms()
+}
+
+// nopTransport satisfies publisher.Transport for the probe above, which
+// never publishes, subscribes or unsubscribes.
+type nopTransport struct{}
+
+func (nopTransport) Publish(context.Context, string, []byte, byte, bool) error { return nil }
+
+func (nopTransport) Subscribe(context.Context, string, byte, publisher.Handler) error { return nil }
+
+func (nopTransport) Unsubscribe(context.Context, string) error { return nil }
+
 // DiscoveryQoS is the delivery guarantee of every retained discovery
 // config publish and of the bridge availability marker.
 //
@@ -189,6 +249,16 @@ type Coordinator struct {
 
 	secondaryIdx  atomic.Int32
 	discoverySent atomic.Bool
+
+	// haBundle is the one retained device document this daemon publishes,
+	// rendered once after the STATIC read that supplies the serial the
+	// node id and the device block are keyed on. Nil means the document
+	// could not be built or did not validate, and publishDiscovery then
+	// publishes NOTHING — see buildBundle.
+	haBundle *discovery.Bundle
+	// haBundleTopic caches haBundle's config topic so the orphan sweep's
+	// claim set does not have to re-derive it.
+	haBundleTopic string
 	// discoveryGen counts Home Assistant birth announcements.
 	// publishDiscovery samples it before its first publish and only marks
 	// discovery as sent when it is unchanged afterwards, so a birth that
@@ -266,6 +336,28 @@ func New(d Deps) *Coordinator {
 	}
 	if d.HARuntime == nil {
 		panic("coordinator: Deps.HARuntime is required; build it at the composition root so Will() can be read before CONNECT")
+	}
+	// The runtime must state the per-entity topic form this fleet is on,
+	// and it is checked here rather than trusted because getting it wrong
+	// is total, silent, and invisible from every direction: a runtime built
+	// without publisher.Config.LegacyEntityTopics retracts the five-segment
+	// form nothing in this fleet uses, so the device document is published
+	// while all 100 per-entity configs are still retained, Home Assistant
+	// refuses it with a single WARNING in its own log, and the entities
+	// simply do not appear. Nothing on the wire says so and nothing here
+	// would have.
+	//
+	// A panic, because it is a composition-root mistake and not a runtime
+	// condition — the same reason the nil check above is one.
+	// [HARuntimeConfig] is the answer; this is what makes bypassing it
+	// loud.
+	want := wantLegacyForms()
+	if forms := d.HARuntime.LegacyForms(); !slices.Equal(forms, want) {
+		panic("coordinator: Deps.HARuntime states legacy config topic forms " +
+			fmt.Sprint(forms) + ", want " + fmt.Sprint(want) +
+			"; build it with HARuntimeConfig, or the device bundle is published " +
+			"while the per-entity configs are still retained and Home Assistant " +
+			"refuses it in silence")
 	}
 	if d.StatePlane == nil {
 		panic("coordinator: Deps.StatePlane is required; build it at the composition root so the state QoS is stated there")
@@ -373,11 +465,13 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		for _, diag := range c.deps.HASS.Diagnostics() {
 			c.deps.Logger.Warn("coordinator.discovery_diag", slog.String("note", diag))
 		}
+		c.buildBundle()
 		published := c.publishDiscovery(ctx)
 		// Clear any of our own retained discovery configs that we no longer
 		// publish (entities removed, renamed or re-platformed across catalog
 		// or daemon versions), so they don't linger as unavailable entities
 		// in Home Assistant.
+		//
 		c.reconcileOrphans(ctx, published)
 	}
 
@@ -732,72 +826,139 @@ func (c *Coordinator) loadTopicParts() (topicParts, bool) {
 	return tp, ok
 }
 
-// publishDiscovery sends every HA discovery payload with retain=true
-// and subscribes to every writable entity's command topic so HA can
-// drive the inverter back. Existing command-topic subscriptions are
-// idempotent on the adapter — re-subscribing on reconnect is safe.
+// buildBundle renders the one retained device document this daemon
+// publishes, and refuses to publish anything at all if it does not hold up.
 //
-// It returns the set of config topics it advertised. A topic is included
-// even when its publish fails, so a transient broker error never makes
-// orphan reconciliation clear an entity we still intend to publish.
+// It runs once, after [hass.Discovery.Initialize], because the node id and
+// the device block are both keyed on the serial the STATIC read supplies.
 //
-// discoverySent is only raised when the whole batch went out AND no
-// Home Assistant birth arrived meanwhile. Marking it sent
-// unconditionally left HA without any entities until the next daemon
-// restart whenever the broker was unavailable at startup (an open
-// circuit breaker publishes nothing at all), and let the final
-// Store(true) overwrite the Store(false) a concurrent birth had just
-// set. Leaving it false makes discoveryRepublisher try again in 5 s.
+// # Why a failure here withholds the whole migration
+//
+// Publishing the document retracts the 100 per-entity configs first, and
+// that retraction is not reversible by this process: between the two the
+// entities are ABSENT rather than unavailable. So the one outcome worse
+// than not migrating is migrating into a document Home Assistant then
+// discards — which it does in silence, with no line on the wire and one
+// WARNING in its own log. Leaving haBundle nil means publishDiscovery
+// publishes nothing, nothing is retracted, and the installed base keeps
+// the per-entity configs it already has and goes on working.
+//
+// discovery.Validate is therefore run here rather than on the publish path.
+// The library warns that wiring it into a publish path is fail-closed — one
+// bad component costs a device all of its entities — and that is precisely
+// the trade being made on purpose: the alternative failure mode is the same
+// loss plus a retraction that cannot be undone.
+//
+// The failure is deterministic (the catalogue is compiled in), so
+// discoverySent is left true and discoveryRepublisher does not spin on it.
+func (c *Coordinator) buildBundle() {
+	log := c.deps.Logger
+	bundle, err := hass.RenderBundle(c.deps.HASS, hass.BundleOrigin(version.Version))
+	if err != nil {
+		log.Error("coordinator.discovery_bundle_render", slog.String("err", err.Error()))
+		c.discoverySent.Store(true)
+		return
+	}
+	if err := discovery.Validate(bundle); err != nil {
+		var verr *discovery.ValidationError
+		if errors.As(err, &verr) && !verr.Blocking() {
+			// Warnings are keys Home Assistant accepts and then rewrites.
+			// They are worth saying out loud and are not worth withholding
+			// a hundred entities over.
+			log.Warn("coordinator.discovery_bundle_warnings",
+				slog.String("node_id", bundle.NodeID),
+				slog.Any("warnings", verr.Warnings))
+		} else {
+			log.Error("coordinator.discovery_bundle_invalid",
+				slog.String("node_id", bundle.NodeID),
+				slog.String("err", err.Error()))
+			c.discoverySent.Store(true)
+			return
+		}
+	}
+	c.haBundle = bundle
+	c.haBundleTopic = hass.BundleConfigTopic(c.deps.HARuntime.Prefix(), c.deps.HASS)
+	log.Info("coordinator.discovery_bundle_built",
+		slog.String("topic", c.haBundleTopic),
+		slog.Int("components", len(bundle.Components)))
+}
+
+// publishDiscovery writes the retained device document — ONE message
+// carrying all 100 entities — and returns the set of config topics this
+// daemon claims, for the orphan sweep.
+//
+// # The ordering this function exists to get right
+//
+// Home Assistant refuses a device document while a per-entity config for
+// one of its components' unique_ids is still retained, and it refuses the
+// per-entity config while the document is retained: the refusal is
+// symmetric, silent on the wire, and shows up as exactly one line —
+// "WARNING [mqtt.entity] Received a conflicting MQTT discovery message".
+// The entities simply do not appear. Measured on Home Assistant 2026.9 on
+// 2026-09-10/11.
+//
+// So the order is always retract first, publish second, and the retraction
+// must be COMPLETE before the document goes out. publisher.Runtime's
+// PublishBundle does both in that order: it renders the superseded topics
+// from the document's own components through the form stated in
+// publisher.Config.LegacyEntityTopics (hass.LegacyConfigTopicForms, the
+// four-segment shape 100 of 100 of this fleet's configs are on), publishes
+// a retained empty payload to each, and ABORTS before the document if one
+// of them fails.
+//
+// "Complete" at [DiscoveryQoS] — QoS 0 — means the bytes have been written
+// and flushed to the broker's socket, in order, ahead of the document's.
+// There is no acknowledgement at QoS 0 and this code does not pretend there
+// is one; what it relies on is MQTT's ordering guarantee for equal-QoS
+// publishes on one connection, which is the property that actually matters:
+// the document cannot reach the broker down a path its retractions did not
+// already travel. A connection that dies in between loses both, and the
+// next connect rebuilds from scratch. TestRetractionsPrecedeTheBundle and
+// TestAFailedRetractionWithholdsTheBundle pin both halves.
+//
+// The document is written even when it is byte-identical to the retained
+// one only on the first publish of a process: the runtime dedups, and on a
+// birth-triggered republish of an unchanged fleet that costs zero broker
+// writes and zero retractions.
 func (c *Coordinator) publishDiscovery(ctx context.Context) map[string]bool {
-	if c.deps.HASS == nil {
+	if c.deps.HASS == nil || c.haBundle == nil {
 		return nil
 	}
 	log := c.deps.Logger
 	gen := c.discoveryGen.Load()
-	entries := c.deps.HASS.Entries()
-	published := make(map[string]bool, len(entries))
-	failed := 0
-	written := 0
-	for _, e := range entries {
-		published[e.ConfigTopic] = true
-		// Through the runtime rather than straight to the client: the
-		// runtime records what this process claims, and that claim set is
-		// what keeps the orphan sweep off a config this daemon is
-		// publishing right now — including one still inside its own
-		// Publish call. internal/hass keeps rendering the payload; only
-		// the writer changed.
-		//
-		// It also dedups: on a steady-state republish every one of the 100
-		// payloads is byte-identical to the retained one already on the
-		// broker, and Home Assistant re-reads and re-validates each.
-		ok, err := c.deps.HARuntime.Publish(ctx, e.ConfigTopic, e.Payload)
-		if err != nil {
-			failed++
-			log.Warn("coordinator.discovery_publish",
-				slog.String("topic", e.ConfigTopic),
-				slog.String("err", err.Error()))
-			continue
-		}
-		if ok {
-			written++
-		}
-	}
-	birthRaced := c.discoveryGen.Load() != gen
-	complete := failed == 0 && !birthRaced
-	c.discoverySent.Store(complete)
-	if !complete {
+
+	// The claim set the sweep subtracts. It names the document even when
+	// the publish below fails, so a transient broker error never makes the
+	// sweep clear a config this daemon still intends to publish.
+	published := map[string]bool{c.haBundleTopic: true}
+
+	written, err := c.deps.HARuntime.PublishBundle(ctx, c.haBundle)
+	if err != nil {
+		log.Warn("coordinator.discovery_publish",
+			slog.String("topic", c.haBundleTopic),
+			slog.String("err", err.Error()))
+		c.discoverySent.Store(false)
 		log.Warn("coordinator.discovery_incomplete",
-			slog.Int("entries", len(entries)),
-			slog.Int("failed", failed),
-			slog.Bool("birth_raced", birthRaced))
+			slog.Int("entries", len(c.haBundle.Components)),
+			slog.Int("failed", 1),
+			slog.Bool("birth_raced", false))
 		return published
 	}
-	// written is reported beside entries because the gap between them is
-	// the measurable effect of the dedup gate: a birth-triggered republish
-	// of an unchanged fleet should show written=0.
+	birthRaced := c.discoveryGen.Load() != gen
+	c.discoverySent.Store(!birthRaced)
+	if birthRaced {
+		log.Warn("coordinator.discovery_incomplete",
+			slog.Int("entries", len(c.haBundle.Components)),
+			slog.Int("failed", 0),
+			slog.Bool("birth_raced", true))
+		return published
+	}
+	// written is reported because the gap between it and the component
+	// count is the measurable effect of the dedup gate: a birth-triggered
+	// republish of an unchanged fleet should show written=false.
 	log.Info("coordinator.discovery_sent",
-		slog.Int("entries", len(entries)),
-		slog.Int("written", written))
+		slog.Int("entries", len(c.haBundle.Components)),
+		slog.Bool("written", written))
 	return published
 }
 

@@ -5,48 +5,271 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"slices"
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/SukramJ/go-mtec2mqtt/internal/hass"
+	"github.com/SukramJ/go-mtec2mqtt/internal/registers"
+	"github.com/SukramJ/go-mtec2mqtt/internal/version"
 )
 
 // TestPublishDiscoveryReturnsPublishedSet checks that publishDiscovery
-// reports the full set of config topics it advertised, so the caller can
-// hand it to reconcileOrphans. Every returned topic must also have been
-// published to the broker with retain=true.
+// reports the set of config topics it claims, so the caller can hand it to
+// reconcileOrphans.
+//
+// Since the move to the device bundle that set is exactly ONE topic —
+// homeassistant/device/<serial>/config — where it used to be one per
+// entity. The count is asserted rather than merely the membership, because
+// a set that still carried the 100 per-entity topics would make the sweep
+// SPARE the very configs this release exists to retract.
 func TestPublishDiscoveryReturnsPublishedSet(t *testing.T) {
 	c, _, mqttStub, _ := buildDeps(t, true)
-	c.deps.HASS.Initialize("MTEC-TEST-001", "V1", "model")
+	initDiscovery(t, c)
 
 	published := c.publishDiscovery(context.Background())
 
-	entries := c.deps.HASS.Entries()
-	if len(entries) == 0 {
-		t.Fatal("no discovery entries built")
+	want := "homeassistant/device/mtec-test-001/config"
+	if len(published) != 1 || !published[want] {
+		t.Fatalf("published set = %v, want exactly {%q}", published, want)
 	}
-	if len(published) != len(entries) {
-		t.Fatalf("published set size = %d, want %d (one per entry)", len(published), len(entries))
+	// The document itself went out retained, and the per-entity topics it
+	// replaces were cleared with a retained EMPTY payload — MQTT's
+	// retraction — rather than simply stopped being published.
+	var doc, retractions int
+	for _, p := range mqttStub.snapshotPublishes() {
+		if !p.retain {
+			t.Errorf("%q was published non-retained; a discovery config the broker "+
+				"does not keep is gone the moment Home Assistant restarts", p.topic)
+		}
+		if p.topic == want {
+			doc++
+			if len(p.payload) == 0 {
+				t.Error("the device document was published empty — that is a retraction")
+			}
+			continue
+		}
+		if len(p.payload) != 0 {
+			t.Errorf("%q carried a payload; the only non-document write of a discovery "+
+				"pass is a retraction", p.topic)
+		}
+		retractions++
 	}
-	for _, e := range entries {
-		if !published[e.ConfigTopic] {
-			t.Errorf("published set missing %q", e.ConfigTopic)
+	if doc != 1 {
+		t.Errorf("the device document was published %d times, want 1", doc)
+	}
+	if retractions != len(c.deps.HASS.Entries()) {
+		t.Errorf("retracted %d per-entity topics, want %d (one per pre-migration entry)",
+			retractions, len(c.deps.HASS.Entries()))
+	}
+}
+
+// TestTheDocumentsOriginNamesThisBuild reads the `origin` block off the
+// wire rather than off hass.BundleOrigin, because the wiring is what a
+// mutation pass found unguarded: the coordinator could have handed it the
+// INVERTER's firmware and every assertion still passed.
+//
+// Home Assistant requires an origin on a device bundle — discovery.Validate
+// blocks without a name, which withholds the whole migration — and its
+// sw_version is the one thing on the document that answers "which build of
+// which program wrote this". The device block's own sw_version answers the
+// other question and the two must not be swapped.
+func TestTheDocumentsOriginNamesThisBuild(t *testing.T) {
+	c, _, mqttStub, _ := buildDeps(t, true)
+	initDiscovery(t, c)
+	c.publishDiscovery(context.Background())
+
+	const doc = "homeassistant/device/mtec-test-001/config"
+	var body []byte
+	for _, p := range mqttStub.snapshotPublishes() {
+		if p.topic == doc {
+			body = p.payload
 		}
 	}
-	// A representative topic must also have gone out retained.
-	const want = "homeassistant/select/MTEC_mode/config"
-	if !published[want] {
-		t.Errorf("published set missing %q", want)
+	if body == nil {
+		t.Fatal("the device document was never published")
 	}
-	retained := false
-	for _, p := range mqttStub.snapshotPublishes() {
-		if p.topic == want && p.retain {
-			retained = true
+	var got struct {
+		Origin struct {
+			Name string `json:"name"`
+			SW   string `json:"sw_version"`
+			URL  string `json:"support_url"`
+		} `json:"origin"`
+		Device struct {
+			SW string `json:"sw_version"`
+		} `json:"device"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("the published document is not valid json: %v", err)
+	}
+	if got.Origin.Name != hass.OriginName || got.Origin.URL != hass.OriginURL {
+		t.Errorf("origin = %+v, want name %q url %q", got.Origin, hass.OriginName, hass.OriginURL)
+	}
+	if got.Origin.SW != version.Version {
+		t.Errorf("origin.sw_version = %q, want this build's version %q",
+			got.Origin.SW, version.Version)
+	}
+	// The fixture's inverter firmware is "V1"; the two answers must not be
+	// the same string by accident either.
+	if got.Origin.SW == got.Device.SW {
+		t.Errorf("origin.sw_version and device.sw_version are both %q; origin names "+
+			"the program, device names the inverter", got.Origin.SW)
+	}
+}
+
+// TestRetractionsPrecedeTheBundle is the ordering the whole release turns
+// on, asserted on the wire rather than inferred from the library's
+// documentation.
+//
+// Home Assistant refuses a device document while a per-entity config for
+// one of its components' unique_ids is still retained, symmetrically, in
+// silence, with one WARNING in its own log and no entities. So every
+// retraction must be on the socket before the document is. At
+// [DiscoveryQoS] — QoS 0 — there is no acknowledgement to wait for and
+// this daemon does not pretend there is one: what it relies on is that the
+// retractions are written first, on the same connection, and MQTT orders
+// equal-QoS publishes from one client. This test pins the "written first"
+// half; TestAFailedRetractionWithholdsTheBundle pins what happens when one
+// of them does not go out at all.
+func TestRetractionsPrecedeTheBundle(t *testing.T) {
+	c, _, mqttStub, _ := buildDeps(t, true)
+	initDiscovery(t, c)
+	c.publishDiscovery(context.Background())
+
+	const doc = "homeassistant/device/mtec-test-001/config"
+	pubs := mqttStub.snapshotPublishes()
+	docAt := -1
+	for i, p := range pubs {
+		if p.topic == doc {
+			docAt = i
 			break
 		}
 	}
-	if !retained {
-		t.Errorf("%q was not published with retain=true", want)
+	if docAt < 0 {
+		t.Fatal("the device document was never published")
+	}
+	// Every per-entity config the document supersedes must appear BEFORE
+	// it, and the set must be complete — a single survivor is enough for
+	// Home Assistant to refuse the whole device.
+	want := map[string]bool{}
+	for _, e := range c.deps.HASS.Entries() {
+		want[e.ConfigTopic] = true
+	}
+	for _, p := range pubs[:docAt] {
+		delete(want, p.topic)
+	}
+	if len(want) != 0 {
+		t.Errorf("%d per-entity configs were not retracted before the document: %v",
+			len(want), sortedKeys(want))
+	}
+	for _, p := range pubs[docAt+1:] {
+		t.Errorf("%q was written after the document; a retraction that lands late "+
+			"retracts nothing and leaves the conflict in place", p.topic)
+	}
+}
+
+// TestAFailedRetractionWithholdsTheBundle is the dangerous window's guard.
+//
+// Between the retractions and the document the entities are ABSENT, not
+// merely unavailable. Having cleared the old configs and then failed to
+// write the new one is the one outcome worse than not having started, so a
+// retraction the broker refuses must abort before the document rather than
+// press on.
+func TestAFailedRetractionWithholdsTheBundle(t *testing.T) {
+	c, _, mqttStub, _ := buildDeps(t, true)
+	c.deps.Logger = slog.New(slog.DiscardHandler)
+	initDiscovery(t, c)
+
+	mqttStub.setPublishErr(errInjected{})
+	published := c.publishDiscovery(context.Background())
+
+	const doc = "homeassistant/device/mtec-test-001/config"
+	for _, p := range mqttStub.snapshotPublishes() {
+		if p.topic == doc {
+			t.Fatal("the document was published although a retraction failed")
+		}
+	}
+	if c.discoverySent.Load() {
+		t.Error("discovery was marked sent although nothing was published; " +
+			"the republisher would never retry")
+	}
+	// The claim set still names the document, so the sweep that runs next
+	// does not treat it as an orphan.
+	if !published[doc] {
+		t.Errorf("published set = %v, want it to still claim %q", published, doc)
+	}
+}
+
+// TestTheCrashWindowHealsOnTheNextBoot answers the question a migration
+// has to answer out loud: what if the daemon dies with the retractions out
+// and the document not.
+//
+// The broker then holds no discovery config for this device at all and
+// Home Assistant shows no entities. Nothing in this process can repair
+// that, because the process is gone. What makes it survivable is that a
+// fresh process starts with an empty superseded set and an empty declared
+// set, so it re-runs the retraction (a no-op against topics the broker has
+// already cleared) and then publishes the document. Asserted by building a
+// second runtime over the SAME broker, which is what a restart is.
+func TestTheCrashWindowHealsOnTheNextBoot(t *testing.T) {
+	crashed, _, mqttStub, _ := buildDeps(t, true)
+	crashed.deps.Logger = slog.New(slog.DiscardHandler)
+	initDiscovery(t, crashed)
+
+	// The retractions land; the document does not.
+	mqttStub.setFailPublishTo("homeassistant/device/mtec-test-001/config", errInjected{})
+	crashed.publishDiscovery(context.Background())
+	const doc = "homeassistant/device/mtec-test-001/config"
+	legacy := map[string]bool{}
+	for _, e := range crashed.deps.HASS.Entries() {
+		legacy[e.ConfigTopic] = true
+	}
+	retracted := map[string]bool{}
+	for _, p := range mqttStub.snapshotPublishes() {
+		if p.topic == doc {
+			t.Fatal("the document was published although its write was refused")
+		}
+		if legacy[p.topic] && len(p.payload) == 0 {
+			retracted[p.topic] = true
+		}
+	}
+	if len(retracted) != len(legacy) {
+		t.Fatalf("retracted %d topics, want the full %d — the fixture is not in the "+
+			"crash window", len(retracted), len(legacy))
+	}
+
+	// The restart: a new process, so a new publisher.Runtime with an empty
+	// superseded set and an empty declared set. Both halves matter — a
+	// runtime that remembered the retractions would skip them, and one
+	// that remembered the document would dedup it away.
+	fresh, _, freshStub, _ := buildDeps(t, true)
+	initDiscovery(t, fresh)
+	fresh.publishDiscovery(context.Background())
+
+	var document, redone int
+	for _, p := range freshStub.snapshotPublishes() {
+		if p.topic == doc && len(p.payload) > 0 {
+			document++
+			continue
+		}
+		if retracted[p.topic] && len(p.payload) == 0 {
+			redone++
+		}
+	}
+	if document != 1 {
+		t.Error("the next boot did not publish the document; the crash window would " +
+			"leave the device with no discovery config at all, forever")
+	}
+	if redone != len(retracted) {
+		t.Errorf("the next boot re-retracted %d of %d topics; a boot that trusts a "+
+			"previous process's retraction is a boot that publishes into a conflict",
+			redone, len(retracted))
+	}
+	if !fresh.discoverySent.Load() {
+		t.Error("the next boot did not mark discovery sent")
 	}
 }
 
@@ -59,7 +282,7 @@ func TestPublishDiscoveryReturnsPublishedSet(t *testing.T) {
 // re-validates each. The second pass must therefore write nothing.
 func TestDiscoveryRepublishIsDeduplicated(t *testing.T) {
 	c, _, mqttStub, _ := buildDeps(t, true)
-	c.deps.HASS.Initialize("MTEC-TEST-001", "V1", "model")
+	initDiscovery(t, c)
 
 	c.publishDiscovery(context.Background())
 	first := len(mqttStub.snapshotPublishes())
@@ -75,13 +298,16 @@ func TestDiscoveryRepublishIsDeduplicated(t *testing.T) {
 	if n := len(mqttStub.snapshotPublishes()); n != 0 {
 		t.Errorf("the republish wrote %d of %d configs again; the dedup gate is not engaged", n, first)
 	}
-	// The reported set is still the whole fleet: a deduped config is one
+	// The reported set still claims the document: a deduped config is one
 	// this process still claims, and dropping it from the set would make
 	// the sweep judge it an orphan and delete it.
-	if len(published) != first {
-		t.Errorf("published set shrank to %d, want %d — the sweep would clear the difference",
-			len(published), first)
+	if !published["homeassistant/device/mtec-test-001/config"] {
+		t.Errorf("published set = %v, want it to still claim the document", published)
 	}
+	// And the retractions are NOT repeated. After the first pass the broker
+	// holds nothing at those topics, so a second round is a message for
+	// nothing — and a boot that rewrote the document forty times would
+	// otherwise send forty rounds of them.
 }
 
 // sweepFixture drives one sweep pass end to end against the stub broker:
@@ -96,7 +322,7 @@ func sweepFixture(t *testing.T, retained map[string][]byte) []string {
 
 	c, _, mqttStub, _ := buildDeps(t, true)
 	c.deps.Logger = slog.New(slog.DiscardHandler)
-	c.deps.HASS.Initialize("MTEC-TEST-001", "V1", "model")
+	initDiscovery(t, c)
 	published := c.publishDiscovery(context.Background())
 
 	mqttStub.mu.Lock()
@@ -158,13 +384,17 @@ func TestSweepRetractsOnlyOurOwnOrphans(t *testing.T) {
 		orphan     = "homeassistant/sensor/MTEC_old_sensor/config"
 		foreign    = "homeassistant/sensor/zigbee2mqtt_0x1/config"
 		sibling    = "homeassistant/sensor/MTEC_grid_power/config"
-		bundle     = "homeassistant/device/MTEC_MT1234567890/config"
+		bundle     = "homeassistant/device/mtec_mt1234567890/config"
 		nodeID     = "homeassistant/sensor/node/MTEC_via_node/config"
 		otherPlat  = "homeassistant/climate/MTEC_thermostat/config"
 		alreadyOut = "homeassistant/sensor/MTEC_already_gone/config"
 	)
 	retracted := sweepFixture(t, map[string][]byte{
-		// Ours and still published — keep.
+		// A per-entity config of the release being upgraded FROM. Since
+		// the move to the device bundle this daemon publishes no
+		// four-segment config at all, so this one is not "current" any
+		// more: it is exactly what the migration must clear, and leaving
+		// it retained is what makes Home Assistant refuse the document.
 		current: []byte(`{"unique_id":"MTEC_mode","state_topic":"MTEC/MTEC-TEST-001/config/mode/state"}`),
 		// Ours, in our namespace, under our root, and no longer published.
 		// The one topic this pass may clear.
@@ -188,8 +418,22 @@ func TestSweepRetractsOnlyOurOwnOrphans(t *testing.T) {
 		alreadyOut: {},
 	})
 
-	if len(retracted) != 1 || retracted[0] != orphan {
-		t.Fatalf("the sweep retracted %v, want exactly [%q]", retracted, orphan)
+	want := []string{orphan, current}
+	sort.Strings(want)
+	if !slices.Equal(retracted, want) {
+		t.Fatalf("the sweep retracted %v, want exactly %v", retracted, want)
+	}
+	// Said separately because it is the whole safety property: the six
+	// declined rows are somebody else's entities, and the one that matters
+	// most is the device document under ANOTHER serial. Two daemons against
+	// two inverters each own a bundle topic keyed on their own serial, and a
+	// sweep that claimed the bundle form would delete the other's fleet on
+	// every boot. hass.OwnsConfigTopic declines the bundle form outright.
+	for _, got := range retracted {
+		if got == bundle {
+			t.Fatal("the sweep retracted a device document; with the node id keyed on " +
+				"the serial that is a sibling instance's whole fleet")
+		}
 	}
 }
 
@@ -200,13 +444,67 @@ func TestSweepRetractsOnlyOurOwnOrphans(t *testing.T) {
 // this process is publishing right now included. `Retract(res.Owned...)`
 // is the composition that cleared 29 live configs in a sibling repo. The
 // claim subtraction is what stands between this daemon and that.
+//
+// # Why the claim is minted by hand
+//
+// Since the move to the device bundle this daemon publishes exactly one
+// config topic and it is of the bundle form, which hass.OwnsConfigTopic
+// declines — so no config the window offers is ever claimed, and the
+// subtraction is INERT in production today. That is a fact about this
+// release, not a reason to delete the guard: it is the library-level net
+// under publisher.Runtime.PublishComponent (the documented rollback
+// direction) and under any future per-entity publish, and a guard that is
+// deleted while it is inert is a guard nobody puts back. So the claim is
+// minted directly on the runtime, which is what makes this test a test of
+// the mechanism rather than of the current call graph.
 func TestSweepSparesAConfigThisProcessStillClaims(t *testing.T) {
+	old := reconcileCollectWindow
+	reconcileCollectWindow = 150 * time.Millisecond
+	t.Cleanup(func() { reconcileCollectWindow = old })
+
 	const live = "homeassistant/select/MTEC_mode/config"
-	retracted := sweepFixture(t, map[string][]byte{
-		live: []byte(`{"unique_id":"MTEC_mode","state_topic":"MTEC/MTEC-TEST-001/config/mode/state"}`),
-	})
+	body := []byte(`{"unique_id":"MTEC_mode","state_topic":"MTEC/MTEC-TEST-001/config/mode/state"}`)
+
+	c, _, mqttStub, _ := buildDeps(t, true)
+	c.deps.Logger = slog.New(slog.DiscardHandler)
+	initDiscovery(t, c)
+	if _, err := c.deps.HARuntime.Publish(context.Background(), live, body); err != nil {
+		t.Fatalf("mint the claim: %v", err)
+	}
+	mqttStub.mu.Lock()
+	mqttStub.publishes = nil
+	mqttStub.mu.Unlock()
+
+	retracted := runSweep(t, c, mqttStub, map[string]bool{live: true}, map[string][]byte{live: body})
 	if len(retracted) != 0 {
 		t.Fatalf("the sweep retracted %v — these are live configs this daemon publishes", retracted)
+	}
+}
+
+// TestSweepClearsTheLegacyConfigsTheBundleReplaces is the other side of
+// the same coin and the reason the claim set had to shrink to one topic.
+//
+// publisher.Runtime.PublishBundle retracts the per-entity configs of the
+// components the document carries; it cannot reach a config whose entity
+// left the catalogue in an EARLIER release, because that entity is in no
+// document to derive a topic from. Only the sweep can, and it can only do
+// so because the published set no longer names the per-entity form.
+func TestSweepClearsTheLegacyConfigsTheBundleReplaces(t *testing.T) {
+	const (
+		fromAnOlderRelease = "homeassistant/sensor/MTEC_withdrawn_in_1_8/config"
+		document           = "homeassistant/device/mtec-test-001/config"
+	)
+	retracted := sweepFixture(t, map[string][]byte{
+		fromAnOlderRelease: []byte(`{"unique_id":"MTEC_withdrawn_in_1_8","state_topic":"MTEC/MTEC-TEST-001/now-base/withdrawn/state"}`),
+		document:           []byte(`{"dev":{"ids":["MTEC-TEST-001"]},"cmps":{}}`),
+	})
+	if !slices.Contains(retracted, fromAnOlderRelease) {
+		t.Errorf("the sweep left %q retained; it re-creates a permanently unavailable "+
+			"phantom entity on every MQTT-integration restart and nothing else can reach it",
+			fromAnOlderRelease)
+	}
+	if slices.Contains(retracted, document) {
+		t.Error("the sweep retracted this daemon's own device document")
 	}
 }
 
@@ -223,7 +521,7 @@ func TestSweepSnapshotIsTakenDownAgain(t *testing.T) {
 
 	c, _, mqttStub, _ := buildDeps(t, true)
 	c.deps.Logger = slog.New(slog.DiscardHandler)
-	c.deps.HASS.Initialize("MTEC-TEST-001", "V1", "model")
+	initDiscovery(t, c)
 	c.sweepOrphans(context.Background(), c.publishDiscovery(context.Background()))
 
 	mqttStub.mu.Lock()
@@ -257,15 +555,18 @@ func TestReportOnlySweepOverTheRealFleet(t *testing.T) {
 	c, discovery, mqttStub, _ := realTopicCoordinator(t)
 	c.deps.Logger = slog.New(slog.DiscardHandler)
 	published := c.publishDiscovery(context.Background())
-	if len(published) != 100 {
-		t.Fatalf("published %d configs, want the real fleet's 100", len(published))
+	const document = "homeassistant/device/mt1234567890/config"
+	if len(published) != 1 || !published[document] {
+		t.Fatalf("published set = %v, want exactly {%q}", published, document)
 	}
 
 	// The broker's retained discovery tree: this fleet, plus the company
 	// it keeps.
 	retained := map[string][]byte{}
+	legacy := map[string]bool{}
 	for _, e := range discovery.Entries() {
 		retained[e.ConfigTopic] = e.Payload
+		legacy[e.ConfigTopic] = true
 	}
 	const leftover = "homeassistant/sensor/MTEC_retired_sensor/config"
 	extras := map[string][]byte{
@@ -325,10 +626,52 @@ func TestReportOnlySweepOverTheRealFleet(t *testing.T) {
 	t.Logf("report: %d retained configs offered, %d claimed by this daemon, %d would be retracted: %v",
 		len(retained), len(published), len(retracted), retracted)
 
-	if len(retracted) != 1 || retracted[0] != leftover {
-		t.Fatalf("the sweep would retract %v, want exactly [%q] — every other row is "+
-			"somebody else's entity", retracted, leftover)
+	// Post-migration the answer is the whole legacy fleet plus the one
+	// leftover: this daemon publishes no four-segment config any more, so
+	// every one of them is superseded. In production PublishBundle has
+	// already cleared the 100 by the time this window opens, and what is
+	// left for the sweep is the residue — a config whose entity left the
+	// catalogue in an earlier release, which no document can name.
+	want := append(sortedKeys(legacy), leftover)
+	sort.Strings(want)
+	if !slices.Equal(retracted, want) {
+		missing, extra := diffStrings(want, retracted)
+		t.Fatalf("the sweep would retract %d topics, want %d\n missing: %v\n   extra: %v",
+			len(retracted), len(want), missing, extra)
 	}
+	// The eight rows that are NOT this daemon's business must all survive,
+	// and each is a population that exists on somebody's broker.
+	for topic := range extras {
+		if topic == leftover {
+			continue
+		}
+		if slices.Contains(retracted, topic) {
+			t.Errorf("the sweep would retract %q — that is somebody else's entity", topic)
+		}
+	}
+}
+
+// diffStrings reports what want has that got does not, and the reverse.
+func diffStrings(want, got []string) (missing, extra []string) {
+	in := map[string]bool{}
+	for _, g := range got {
+		in[g] = true
+	}
+	for _, w := range want {
+		if !in[w] {
+			missing = append(missing, w)
+		}
+	}
+	has := map[string]bool{}
+	for _, w := range want {
+		has[w] = true
+	}
+	for _, g := range got {
+		if !has[g] {
+			extra = append(extra, g)
+		}
+	}
+	return missing, extra
 }
 
 // TestSweepSparesAConfigWhoseOwnPublishFailed is one half of the claim
@@ -342,37 +685,39 @@ func TestReportOnlySweepOverTheRealFleet(t *testing.T) {
 // accepted. Judging on the declared set alone would therefore retract an
 // entity this daemon fully intends to publish, on the next poll, because
 // one earlier write failed.
+//
+// Minted by hand for the reason given on
+// TestSweepSparesAConfigThisProcessStillClaims: the production claim set
+// is one bundle topic, which the sweep's ownership rule declines, so the
+// only way to keep this half of the subtraction non-vacuous is to hand it
+// a config of the form it actually judges.
 func TestSweepSparesAConfigWhoseOwnPublishFailed(t *testing.T) {
 	old := reconcileCollectWindow
 	reconcileCollectWindow = 150 * time.Millisecond
 	t.Cleanup(func() { reconcileCollectWindow = old })
 
+	const refused = "homeassistant/sensor/MTEC_inverter/config"
+	body := []byte(`{"unique_id":"MTEC_inverter","state_topic":"MTEC/MTEC-TEST-001/now-base/inverter/state"}`)
+
 	c, _, mqttStub, _ := buildDeps(t, true)
 	c.deps.Logger = slog.New(slog.DiscardHandler)
-	c.deps.HASS.Initialize("MTEC-TEST-001", "V1", "model")
+	initDiscovery(t, c)
 
-	// Every config publish of this boot fails, so `published` names all of
-	// them and `Declared()` names none.
-	mqttStub.mu.Lock()
-	mqttStub.publishErr = errInjected{}
-	mqttStub.mu.Unlock()
-	published := c.publishDiscovery(context.Background())
-	if len(published) == 0 {
-		t.Fatal("no configs were advertised")
+	// The publish fails, so `published` names it and `Declared()` does not.
+	mqttStub.setPublishErr(errInjected{})
+	if _, err := c.deps.HARuntime.Publish(context.Background(), refused, body); err == nil {
+		t.Fatal("the injected broker error did not reach the runtime")
 	}
-	if n := len(c.deps.HARuntime.Declared()); n != 0 {
-		t.Fatalf("the runtime declared %d configs despite every publish failing", n)
+	mqttStub.setPublishErr(nil)
+	if slices.Contains(c.deps.HARuntime.Declared(), refused) {
+		t.Fatalf("the runtime declared %q despite the publish failing", refused)
 	}
 	mqttStub.mu.Lock()
-	mqttStub.publishErr = nil
 	mqttStub.publishes = nil
 	mqttStub.mu.Unlock()
 
-	retained := map[string][]byte{}
-	for _, e := range c.deps.HASS.Entries() {
-		retained[e.ConfigTopic] = e.Payload
-	}
-	if retracted := runSweep(t, c, mqttStub, published, retained); len(retracted) != 0 {
+	if retracted := runSweep(t, c, mqttStub, map[string]bool{refused: true},
+		map[string][]byte{refused: body}); len(retracted) != 0 {
 		t.Fatalf("the sweep retracted %v — a transient broker error must never clear an "+
 			"entity this daemon still intends to publish", retracted)
 	}
@@ -390,23 +735,25 @@ func TestSweepSparesADeclaredConfigOutsideThisBatch(t *testing.T) {
 	reconcileCollectWindow = 150 * time.Millisecond
 	t.Cleanup(func() { reconcileCollectWindow = old })
 
+	const declared = "homeassistant/sensor/MTEC_inverter/config"
+	body := []byte(`{"unique_id":"MTEC_inverter","state_topic":"MTEC/MTEC-TEST-001/now-base/inverter/state"}`)
+
 	c, _, mqttStub, _ := buildDeps(t, true)
 	c.deps.Logger = slog.New(slog.DiscardHandler)
-	c.deps.HASS.Initialize("MTEC-TEST-001", "V1", "model")
-	c.publishDiscovery(context.Background())
-	if len(c.deps.HARuntime.Declared()) == 0 {
+	initDiscovery(t, c)
+	if _, err := c.deps.HARuntime.Publish(context.Background(), declared, body); err != nil {
+		t.Fatalf("mint the claim: %v", err)
+	}
+	if !slices.Contains(c.deps.HARuntime.Declared(), declared) {
 		t.Fatal("the runtime declared nothing")
 	}
 	mqttStub.mu.Lock()
 	mqttStub.publishes = nil
 	mqttStub.mu.Unlock()
 
-	retained := map[string][]byte{}
-	for _, e := range c.deps.HASS.Entries() {
-		retained[e.ConfigTopic] = e.Payload
-	}
-	// An EMPTY batch, against a broker holding every live config.
-	if retracted := runSweep(t, c, mqttStub, map[string]bool{}, retained); len(retracted) != 0 {
+	// An EMPTY batch, against a broker holding a config the process holds.
+	if retracted := runSweep(t, c, mqttStub, map[string]bool{},
+		map[string][]byte{declared: body}); len(retracted) != 0 {
 		t.Fatalf("an empty batch made the sweep retract %v — these are live configs "+
 			"this process declared", retracted)
 	}
@@ -450,4 +797,105 @@ func runSweep(t *testing.T, c *Coordinator, mqttStub *stubMQTT, published map[st
 	}
 	sort.Strings(got)
 	return got
+}
+
+// --- the document that must not be published --------------------------------
+
+// TestAnInvalidDocumentWithholdsTheWholeMigration is the fail-closed trade
+// this release makes on purpose, and the one failure that does NOT heal by
+// itself.
+//
+// Home Assistant discards a malformed discovery document in silence. If
+// this daemon published one, the 100 working per-entity configs would
+// already have been retracted to make room for it and the fleet would be
+// gone with nothing anywhere saying why. So discovery.Validate runs once,
+// at build time, BEFORE anything is published, and a blocking issue leaves
+// the document nil — which must mean:
+//
+//  1. no document,
+//  2. and, decisively, NO RETRACTION. The installed base keeps the configs
+//     it already has and goes on working.
+//  3. and no orphan sweep, because after this release every four-segment
+//     config the sweep's window finds is an orphan by its own rule — which
+//     is right when the document went out and catastrophic when it did not.
+//
+// The library documents that wiring Validate into a publish path is
+// fail-closed and costs a device all of its entities on one bad component.
+// That is the trade, taken knowingly: the alternative is the same loss
+// plus a retraction that cannot be undone.
+func TestAnInvalidDocumentWithholdsTheWholeMigration(t *testing.T) {
+	// A catalogue Home Assistant's schema refuses: "voltage" is not a
+	// device class a binary_sensor may carry.
+	const refused = `
+"10000":
+  name: Inverter serial number
+  length: 8
+  type: STR
+  mqtt: serial_no
+  group: static
+
+"11000":
+  name: Bad entity
+  length: 1
+  type: U16
+  mqtt: bad_entity
+  group: now-base
+  hass_component_type: binary_sensor
+  hass_device_class: voltage
+`
+	cases := []struct {
+		name   string
+		serial string
+	}{
+		// A blocking issue from discovery.Validate.
+		{"refused by discovery.Validate", "MTEC-TEST-001"},
+		// An empty serial is a device with no identifier at all, so the
+		// render itself refuses. Same verdict, one stage earlier.
+		{"refused by discovery.Render", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, mqttStub, _ := buildDeps(t, true)
+			c.deps.Logger = slog.New(slog.DiscardHandler)
+
+			bad, _, err := registers.LoadFromString(refused)
+			if err != nil {
+				t.Fatalf("load the refused catalogue: %v", err)
+			}
+			c.deps.HASS = hass.New(c.deps.Cfg.HASSBaseTopic, c.deps.Cfg.MQTTTopic,
+				bad, c.deps.Cfg.Language, nil, c.deps.Cfg.DeviceName)
+			c.deps.HASS.Initialize(tc.serial, "V1", "model")
+			c.buildBundle()
+
+			if c.haBundle != nil {
+				t.Fatalf("a document was built from a catalogue the schema refuses: %s",
+					c.haBundleTopic)
+			}
+
+			mqttStub.mu.Lock()
+			mqttStub.publishes = nil
+			mqttStub.mu.Unlock()
+
+			if published := c.publishDiscovery(context.Background()); len(published) != 0 {
+				t.Errorf("publishDiscovery claimed %v with no document", published)
+			}
+			for _, p := range mqttStub.snapshotPublishes() {
+				t.Errorf("%q was written with no document to replace it; an empty "+
+					"retained payload is a retraction and the fleet is now gone", p.topic)
+			}
+
+			// And the sweep refuses too.
+			old := reconcileCollectWindow
+			reconcileCollectWindow = 50 * time.Millisecond
+			t.Cleanup(func() { reconcileCollectWindow = old })
+			c.sweepOrphans(context.Background(), nil)
+			if mqttStub.countSubscribes("homeassistant/#") != 0 {
+				t.Error("the sweep opened its window with no document; every retained " +
+					"per-entity config it finds would be judged an orphan and deleted")
+			}
+			for _, p := range mqttStub.snapshotPublishes() {
+				t.Errorf("the sweep wrote %q with no document", p.topic)
+			}
+		})
+	}
 }

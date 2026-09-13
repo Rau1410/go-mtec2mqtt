@@ -63,8 +63,21 @@ type topicGolden struct {
 	// StateTopics is every topic publishGroupOnce writes a value to,
 	// across all catalog groups.
 	StateTopics []string `json:"state_topics"`
-	// DiscoveryConfigTopics is every retained config topic.
+	// DiscoveryConfigTopics is every per-entity config topic this daemon
+	// RETRACTS on the migration to the device bundle.
+	//
+	// Until this release it was every config topic the daemon published.
+	// The list is byte-identical either way, and that is the point: the
+	// retraction has to name exactly the fleet the previous release left
+	// retained, or Home Assistant refuses the document over the survivor.
+	// It is now derived from the document's own components through
+	// hass.SupersededConfigTopics -- the same call publisher.Runtime makes
+	// -- rather than from the pre-migration builder, so the two cannot
+	// drift.
 	DiscoveryConfigTopics []string `json:"discovery_config_topics"`
+	// DiscoveryBundleTopic is the ONE retained discovery message this
+	// daemon now writes.
+	DiscoveryBundleTopic string `json:"discovery_bundle_topic"`
 	// CommandTopics is every topic an entity tells Home Assistant to
 	// write back to.
 	CommandTopics []string `json:"command_topics"`
@@ -132,6 +145,14 @@ HASS_ENABLE: true
 	// What runStatic would have stored after the STATIC read. Every state
 	// topic is keyed on it, exactly as in production.
 	c.topicBase.Store(topicParts{root: cfg.MQTTTopic, serial: goldenSerial})
+	// The device document, exactly as run() builds it after the STATIC
+	// read. Without it publishDiscovery publishes nothing at all, which is
+	// deliberate (see buildBundle) and would make every test below silent
+	// rather than red.
+	c.buildBundle()
+	if c.haBundle == nil {
+		t.Fatal("the real catalogue does not render a publishable device bundle")
+	}
 	return c, discovery, mqttStub, catalog
 }
 
@@ -234,9 +255,11 @@ func TestTopicGolden(t *testing.T) {
 	}
 
 	configSet := map[string]bool{}
+	for _, topic := range hass.SupersededConfigTopics(c.deps.HARuntime.Prefix(), c.haBundle) {
+		configSet[topic] = true
+	}
 	commandSet := map[string]bool{}
 	for _, e := range discovery.Entries() {
-		configSet[e.ConfigTopic] = true
 		if e.CommandTopic != "" {
 			commandSet[e.CommandTopic] = true
 		}
@@ -256,6 +279,7 @@ func TestTopicGolden(t *testing.T) {
 	got := topicGolden{
 		StateTopics:              sortedKeys(stateSet),
 		DiscoveryConfigTopics:    sortedKeys(configSet),
+		DiscoveryBundleTopic:     c.haBundleTopic,
 		CommandTopics:            sortedKeys(commandSet),
 		SubscribeFilters:         subscribeFilters(t, c, stub),
 		StateTopicsWithoutEntity: sortedKeys(orphanState),
@@ -287,6 +311,10 @@ func TestTopicGolden(t *testing.T) {
 	}
 	diffTopicList(t, "state_topics", want.StateTopics, got.StateTopics)
 	diffTopicList(t, "discovery_config_topics", want.DiscoveryConfigTopics, got.DiscoveryConfigTopics)
+	if want.DiscoveryBundleTopic != got.DiscoveryBundleTopic {
+		t.Errorf("discovery_bundle_topic moved:\n golden: %s\n  built: %s",
+			want.DiscoveryBundleTopic, got.DiscoveryBundleTopic)
+	}
 	diffTopicList(t, "command_topics", want.CommandTopics, got.CommandTopics)
 	diffTopicList(t, "subscribe_filters", want.SubscribeFilters, got.SubscribeFilters)
 	diffTopicList(t, "state_topics_without_entity", want.StateTopicsWithoutEntity, got.StateTopicsWithoutEntity)
@@ -390,15 +418,25 @@ func TestPublishQoSAndRetain(t *testing.T) {
 		}
 	}
 
-	// Discovery: retained, QoS 0.
+	// Discovery: retained, QoS 0 — the device document and the 100
+	// retractions that clear the per-entity form it replaces.
+	//
+	// The retraction half is as load-bearing as the document: an empty
+	// payload published NON-retained clears nothing, so the old config
+	// stays on the broker and Home Assistant refuses the document with one
+	// WARNING and no entities. The count is asserted too, because a
+	// retraction that silently covers 99 of 100 topics fails exactly the
+	// same way as one that covers none.
 	stub.mu.Lock()
 	stub.publishes = nil
 	stub.mu.Unlock()
 	c.publishDiscovery(context.Background())
 	discoveryPubs := stub.snapshotPublishes()
-	if len(discoveryPubs) != 100 {
-		t.Fatalf("discovery publishes = %d, want 100", len(discoveryPubs))
+	if len(discoveryPubs) != 101 {
+		t.Fatalf("discovery publishes = %d, want 101 (100 retractions + 1 device document)",
+			len(discoveryPubs))
 	}
+	documents, retractions := 0, 0
 	for _, p := range discoveryPubs {
 		if p.qos != mqtt.QoS0 {
 			t.Errorf("discovery publish %s: qos = %v, want QoS0", p.topic, p.qos)
@@ -406,6 +444,15 @@ func TestPublishQoSAndRetain(t *testing.T) {
 		if !p.retain {
 			t.Errorf("discovery publish %s: retain = false, want true", p.topic)
 		}
+		if len(p.payload) == 0 {
+			retractions++
+		} else {
+			documents++
+		}
+	}
+	if documents != 1 || retractions != 100 {
+		t.Errorf("discovery pass wrote %d documents and %d retractions, want 1 and 100",
+			documents, retractions)
 	}
 }
 
