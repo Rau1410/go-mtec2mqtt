@@ -48,7 +48,7 @@ services:
 options:
   modbus_ip: "0.0.0.0"
   modbus_port: 502
-  modbus_slave: 247
+  modbus_slave: 255
   modbus_timeout: 5
   modbus_retries: 3
   modbus_framer: socket
@@ -69,7 +69,7 @@ options:
 schema:
   modbus_ip: str
   modbus_port: int(1,65535)
-  modbus_slave: int(0,247)
+  modbus_slave: int(0,255)
   modbus_timeout: int(1,600)
   modbus_retries: int(0,20)
   modbus_framer: "list(ascii|rtu|socket|tls)"
