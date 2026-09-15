@@ -33,7 +33,7 @@ func (f fakeEnv) Environ() []string {
 const minimumYAML = `
 MODBUS_IP: 192.168.0.10
 MODBUS_PORT: 502
-MODBUS_SLAVE: 247
+MODBUS_SLAVE: 255
 MODBUS_TIMEOUT: 5
 MQTT_SERVER: localhost
 MQTT_PORT: 1883
