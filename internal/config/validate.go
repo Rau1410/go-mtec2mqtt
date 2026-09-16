@@ -72,8 +72,8 @@ func Validate(c *Config) error {
 	// holding registers in broadcast mode are silent, which is never
 	// what an end user wants. Allow it (Python schema does) but cap at
 	// 247 per the standard slave-id range.
-	if c.ModbusSlave > 247 {
-		add("MODBUS_SLAVE must be 0..247, got %d", c.ModbusSlave)
+	if c.ModbusSlave > 255 {
+		add("MODBUS_SLAVE must be 0..255, got %d", c.ModbusSlave)
 	}
 	if c.ModbusTimeout < 1 || c.ModbusTimeout > 600 {
 		add("MODBUS_TIMEOUT must be 1..600 seconds, got %d", c.ModbusTimeout)
